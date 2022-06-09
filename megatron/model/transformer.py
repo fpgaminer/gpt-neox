@@ -669,6 +669,7 @@ class ParallelTransformerLayerPipe(ParallelTransformerLayer):
             len(args) == 2
         ), "ParallelTransformerLayerPipe expects 2 arguments - hidden_states and attention_mask"
         hidden_states, attention_mask = args
+        torch.cuda.synchronize()
         # we are returning just [hidden_states, mask]
         return super().forward(hidden_states, attention_mask), attention_mask
 
