@@ -18,15 +18,17 @@
 
 import copy
 import json
+from multiprocessing import context
 import os
 import time
-from typing import List, Union
+from typing import Callable, List, Union
 
 import torch
 import torch.nn.functional as F
 
 from megatron import print_rank_0
 from megatron import mpu
+from megatron.sampling import sample_tokens
 from megatron.utils import get_ltor_masks_and_position_ids, is_mp_rank_0
 
 
@@ -378,6 +380,142 @@ def stream_tokens(
             token_index_to_generate += 1
 
             yield context_tokens, token_generation_start_index, token_generation_end_index, state_is_done.bool()
+            if torch.all(state_is_done):
+                break
+
+
+def stream_tokens2(
+    neox_args,
+    model,
+    context_tokens: List[int],
+    eos_token_id: int,
+    maximum_tokens: int,
+    recompute: bool = False,
+    n_samples: int = 1,
+    n_gens_per_context: int = 1024,
+    filters: List[Callable] = [],
+    return_logits: bool = False,
+):
+    model.eval()
+
+    # pad batch in order to allow conversion to tensor
+    context_length = len(context_tokens)
+    context_tokens = context_tokens + [neox_args.tokenizer.eod] * (neox_args.seq_length - context_length)
+
+    # convert to tensor and broadcast
+    context_tokens = torch.cuda.LongTensor(context_tokens).repeat(n_samples, 1)
+
+    # Make sure context tokens + start tokens are the same across all ranks
+    context_idx = torch.cuda.LongTensor([context_length])
+    torch.distributed.broadcast(
+        context_tokens,
+        mpu.get_model_parallel_src_rank(),
+        group=mpu.get_model_parallel_group(),
+    )
+    torch.distributed.broadcast(
+        context_idx,
+        mpu.get_model_parallel_src_rank(),
+        group=mpu.get_model_parallel_group(),
+    )
+    context_idx = context_idx.item()
+
+
+    # get attention mask / position ids
+    context_tokens, attention_mask, position_ids = get_batch(neox_args, context_tokens)
+
+    # set variables
+    batch_size = context_tokens.size(0)
+    is_new_context = True
+
+    with torch.no_grad():
+        # initialize generation variables
+        state_is_done = torch.zeros([batch_size]).byte().cuda()
+        token_generation_end_index = torch.ones([batch_size]).long().cuda() * (-1)
+        results = torch.zeros(n_samples, maximum_tokens, dtype=torch.long)
+        results_probs = torch.zeros(n_samples, maximum_tokens, dtype=torch.float)
+
+        for result_idx in range(maximum_tokens):
+            if recompute:  # recompute all tokens
+                model_inputs = (
+                    context_tokens,
+                    position_ids,
+                    attention_mask,
+                )
+                logits = forward_model(model, model_inputs, neox_args.is_pipe_parallel)
+                if logits is not None:  # if pipe parallel, not all ranks return logits
+                    generated_token_logits = logits[
+                        :, context_idx - 1, :
+                    ]  # [bs, seq, vocab_size] -> [bs, vocab_size]
+            else:  # use kv cache
+                if is_new_context:
+                    # New context; Need to rebuild the cache
+                    model.module.clear_cache()
+                    tokens_to_use = context_tokens[:, :context_idx]
+                    positions_to_use = position_ids[:, :context_idx]
+                    is_new_context = False
+                elif not recompute:
+                    # Just need to compute the activations for the latest token
+                    tokens_to_use = context_tokens[:, context_idx - 1].view(batch_size, -1)
+                    positions_to_use = position_ids[:, context_idx - 1].view(batch_size, -1)
+                
+                model_inputs = (
+                    tokens_to_use,  # input_ids
+                    positions_to_use,  # position_ids
+                    attention_mask,  # attention_mask
+                )
+
+                logits = forward_model(model, model_inputs, neox_args.is_pipe_parallel)
+                if logits is not None:  # if pipe parallel, not all ranks return logits
+                    generated_token_logits = (
+                        logits[:, -1].view(batch_size, -1).contiguous()
+                    )  # [bs, seq, vocab_size] -> [bs, vocab_size]
+            
+            if logits is not None:
+                generated_tokens, generated_token_probs = sample_tokens(generated_token_logits, context_tokens[:, :context_idx], filters)
+            
+            #print(f"Device {torch.cuda.current_device()}, is_pipe_parallel: {neox_args.is_pipe_parallel}, {mpu.get_model_parallel_src_rank()} =? {model.grid.stage_to_global(model.num_stages - 1)}")
+
+            if neox_args.is_pipe_parallel:
+                # broadcast generated tokens to pipe parallel group
+                src_rank = model.grid.stage_to_global(model.num_stages - 1)
+                generated_tokens = (
+                    generated_tokens
+                    if logits is not None
+                    else torch.zeros(batch_size, dtype=torch.long).cuda()
+                )
+                torch.distributed.broadcast(
+                    tensor=generated_tokens,
+                    src=src_rank,
+                    group=mpu.get_pipe_parallel_group(),
+                )
+            
+            #print(f"Device {torch.cuda.current_device()} generated tokens [{result_idx}]: {generated_tokens}")
+            
+            # update context
+            if context_idx == neox_args.seq_length:
+                context_idx -= n_gens_per_context
+                context_tokens = context_tokens.roll(shifts=-n_gens_per_context, dims=1)
+                is_new_context = True
+            
+            results[:, result_idx] = generated_tokens
+            results_probs[:, result_idx] = generated_token_probs
+            context_tokens[:, context_idx] = generated_tokens
+
+            # determine if state has finished for each batch item
+            state_done = (
+                generated_tokens == eos_token_id
+            ).byte()  # check which batch items produce an eos_token in the current iteration
+            state_is_done = state_is_done | state_done
+
+            token_generation_end_index[(~state_is_done).bool()] = result_idx
+
+            context_idx += 1
+            result_idx += 1
+
+            if return_logits:
+                yield results, results_probs, logits, token_generation_end_index, state_is_done.bool()
+            else:
+                yield results, results_probs, token_generation_end_index, state_is_done.bool()
             if torch.all(state_is_done):
                 break
 
